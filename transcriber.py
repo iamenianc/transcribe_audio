@@ -10,6 +10,8 @@ Everything runs offline on the CPU. No audio ever leaves the machine.
 
 import argparse
 import contextlib
+import datetime
+import os
 import queue
 import re
 import sys
@@ -31,6 +33,10 @@ TRIGGER_KEYS = {Key.ctrl_l, Key.cmd}
 # Keys that, tapped together, TOGGLE a long hands-free session on/off (Win +
 # Left-Shift). The toggle is edge-triggered so one tap fires once (see App).
 TOGGLE_KEYS = {Key.cmd, Key.shift_l}
+
+# Long-session transcripts are auto-saved here (one file per session) so the full
+# text survives even if the target window is lost or stops accepting input.
+TRANSCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
 
 # "Pure" fillers: sounds that are never legitimate English words, so they can be
 # deleted wherever they appear as standalone tokens.
@@ -438,6 +444,7 @@ class App:
         self._toggle_armed = True   # edge-trigger guard for the toggle combo
         self._session_stop = None   # threading.Event signalling the live worker to finish
         self._worker = None         # live-transcription worker thread
+        self._transcript = None     # open file for the current session's auto-saved transcript
         self._lock = threading.Lock()
 
     def _on_press(self, key):
@@ -484,6 +491,7 @@ class App:
                 if self._recording:
                     return
                 self._session = True
+                self._open_transcript()
                 print("\n[long] Long session recording (typing live as you speak)... "
                       "(tap Win+Left-Shift again to stop)")
                 self.recorder.start()
@@ -556,6 +564,7 @@ class App:
             max_chunk_s=self.max_chunk_s, min_silence_s=self.min_silence_s,
         ):
             self._type_chunk(chunk)
+        self._close_transcript()
         print("[long] Session complete.")
 
     def _type_chunk(self, chunk):
@@ -564,7 +573,45 @@ class App:
         if not text:
             return
         print(f"[out] {text}")
+        self._save_line(text)   # persist BEFORE typing, so a lost window never loses text
         self._type(text + "\n")
+
+    def _open_transcript(self):
+        """Start a fresh auto-save file for this long session.
+
+        One file per session, named by start time. Each completed chunk is
+        appended immediately (and flushed to disk) so the full transcript
+        survives even if the focused window stops accepting typed input.
+        Best-effort: failure to open just disables saving for this session.
+        """
+        try:
+            os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(TRANSCRIPT_DIR, f"session-{stamp}.txt")
+            self._transcript = open(path, "a", encoding="utf-8")
+            print(f"[long] Saving transcript to {path}")
+        except Exception as exc:
+            self._transcript = None
+            print(f"[long] Could not open transcript file ({exc}); continuing without auto-save.",
+                  file=sys.stderr)
+
+    def _save_line(self, text):
+        """Append one transcribed line to the session file and flush to disk."""
+        f = self._transcript
+        if f is None:
+            return
+        try:
+            f.write(text + "\n")
+            f.flush()
+            os.fsync(f.fileno())   # force to disk so an abrupt exit can't lose it
+        except Exception as exc:
+            print(f"[long] Failed to write transcript ({exc}).", file=sys.stderr)
+
+    def _close_transcript(self):
+        if self._transcript is not None:
+            with contextlib.suppress(Exception):
+                self._transcript.close()
+            self._transcript = None
 
     def run(self):
         print("\nReady. Hold Ctrl+Win to dictate, or tap Win+Left-Shift for a "
