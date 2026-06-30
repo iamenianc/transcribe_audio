@@ -15,6 +15,9 @@ env/
 models/
 *.onnx
 
+# Auto-saved long-session transcripts (one file per session)
+transcripts/
+
 # Editor / OS
 .vscode/
 .idea/
