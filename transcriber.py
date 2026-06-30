@@ -746,13 +746,83 @@ def pick_device(name_substring):
     return None
 
 
+def _prompt_choice(title, options):
+    """Show a numbered menu and return the chosen option's key.
+
+    ``options`` is a list of (key, label) tuples. Loops until the user enters a
+    valid number; Ctrl+C / EOF cancels (returns None).
+    """
+    print(f"\n{title}")
+    for i, (_, label) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    while True:
+        try:
+            raw = input("Enter choice [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw == "":
+            return options[0][0]          # default to the first option
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][0]
+        print(f"  Please enter a number between 1 and {len(options)}.")
+
+
+def _prompt_file_path():
+    """Prompt for a media file path, re-asking until it exists. None cancels."""
+    while True:
+        try:
+            raw = input("Path to audio/video file: ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if raw == "":
+            print("  Please enter a path (or Ctrl+C to cancel).")
+            continue
+        if os.path.isfile(raw):
+            return raw
+        print(f"  No such file: {raw}")
+
+
+def interactive_menu(args):
+    """Drive an interactive menu when launched with no arguments.
+
+    Mutates ``args`` in place to reflect the user's choices, then returns True to
+    proceed or False if the user cancelled. Only covers mode selection and the
+    file path; all other settings keep their argparse defaults.
+    """
+    print("=" * 56)
+    print("  Local dictation & transcription (NVIDIA Parakeet, CPU)")
+    print("=" * 56)
+    mode = _prompt_choice(
+        "What would you like to do?",
+        [
+            ("live", "Live dictation (mic) -- hold Ctrl+Win or tap Win+Left-Shift"),
+            ("file", "Transcribe a recorded file (WAV, MP3, MP4, M4A, ...)"),
+            ("quit", "Quit"),
+        ],
+    )
+    if mode is None or mode == "quit":
+        return False
+    if mode == "file":
+        path = _prompt_file_path()
+        if path is None:
+            return False
+        args.file = path
+    return True
+
+
 def main():
     p = argparse.ArgumentParser(description="Push-to-talk local dictation "
-                                            "(NVIDIA Parakeet, ONNX, CPU).")
+                                            "(NVIDIA Parakeet, ONNX, CPU). "
+                                            "Run with no arguments for an interactive menu.")
     p.add_argument("--file", default=None,
                    help="transcribe a prerecorded media file (WAV, MP3, MP4, M4A, ...) in "
                         "batch and write the text to a .txt next to it, then exit (no mic, "
                         "no hotkeys). Non-WAV formats require ffmpeg on PATH.")
+    # Accepted for backward compatibility (run.bat passes it); the Whisper engine
+    # was dropped, so Parakeet is the only option and this is a no-op.
+    p.add_argument("--engine", default="parakeet", help=argparse.SUPPRESS)
     p.add_argument("--device", default="USB PnP",
                    help="substring of the input device name (default: 'USB PnP'). "
                         "Pass '' to use the system default.")
@@ -770,6 +840,13 @@ def main():
                    help="long-session: minimum pause length (seconds) that counts as a "
                         "cut point (default: 0.6).")
     args = p.parse_args()
+
+    # No CLI arguments at all -> drive the interactive menu. Any flag (e.g.
+    # run.bat's --device) bypasses the menu and keeps the direct behavior.
+    if len(sys.argv) == 1:
+        if not interactive_menu(args):
+            print("Cancelled.")
+            return
 
     transcriber = Transcriber(
         scrub=not args.no_scrub,
