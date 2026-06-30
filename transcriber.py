@@ -14,6 +14,7 @@ import queue
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import onnxruntime as ort
@@ -25,8 +26,11 @@ from pynput.keyboard import Controller, Key
 
 SAMPLE_RATE = 16000          # Whisper expects 16 kHz mono
 CHANNELS = 1
-# Keys that must ALL be held down at once to trigger recording.
+# Keys that must ALL be held down at once to trigger (hold-to-talk) recording.
 TRIGGER_KEYS = {Key.ctrl_l, Key.cmd}
+# Keys that, tapped together, TOGGLE a long hands-free session on/off (Win +
+# Left-Shift). The toggle is edge-triggered so one tap fires once (see App).
+TOGGLE_KEYS = {Key.cmd, Key.shift_l}
 
 # "Pure" fillers: sounds that are never legitimate English words, so they can be
 # deleted wherever they appear as standalone tokens.
@@ -195,6 +199,62 @@ class Recorder:
         return np.concatenate(self._frames, axis=0).flatten()
 
 
+def split_on_silence(audio, sample_rate=SAMPLE_RATE, max_chunk_s=30.0,
+                     min_silence_s=0.6, silence_rms=0.005, min_chunk_s=1.0):
+    """Split long audio into model-friendly chunks, cutting only in pauses.
+
+    Pure numpy, no deps. We never cut mid-utterance: a chunk grows until it has
+    exceeded ``max_chunk_s``, then we cut at the NEXT silence gap of at least
+    ``min_silence_s`` (a run of low-RMS frames). A continuous monologue with no
+    such gap stays a single chunk. Audio shorter than ``max_chunk_s`` is returned
+    unchanged as ``[audio]`` so short clips behave exactly as before.
+
+    Returns a list of float32 arrays (silence between kept chunks is dropped).
+    """
+    n = audio.size
+    if n == 0:
+        return []
+    if n <= int(max_chunk_s * sample_rate):
+        return [audio]
+
+    # Per-frame RMS over short hops to classify silence vs. speech.
+    hop = max(1, int(0.02 * sample_rate))            # 20 ms frames
+    n_frames = n // hop
+    if n_frames == 0:
+        return [audio]
+    frames = audio[: n_frames * hop].reshape(n_frames, hop)
+    rms = np.sqrt(np.mean(frames.astype(np.float32) ** 2, axis=1))
+    is_silent = rms < silence_rms
+
+    max_frames = int(max_chunk_s * sample_rate / hop)
+    min_silence_frames = max(1, int(min_silence_s * sample_rate / hop))
+    min_chunk_frames = max(1, int(min_chunk_s * sample_rate / hop))
+
+    chunks = []
+    start = 0          # frame index where the current chunk begins
+    i = 0
+    while i < n_frames:
+        # Once the current chunk is long enough, look for a silence gap to cut on.
+        if i - start >= max_frames and is_silent[i]:
+            j = i
+            while j < n_frames and is_silent[j]:
+                j += 1
+            if j - i >= min_silence_frames:
+                # Cut: keep [start, i) as a chunk, skip the silence, restart after it.
+                if i - start >= min_chunk_frames:
+                    chunks.append(audio[start * hop : i * hop])
+                start = j
+                i = j
+                continue
+        i += 1
+
+    # Trailing chunk (everything from the last cut to the end of the audio).
+    if n - start * hop >= min_chunk_frames * hop:
+        chunks.append(audio[start * hop :])
+
+    return chunks if chunks else [audio]
+
+
 @contextlib.contextmanager
 def _below_normal_priority(enabled=True):
     """Temporarily drop this process to below-normal CPU priority.
@@ -292,21 +352,63 @@ class Transcriber:
             text = cleaned
         return text
 
+    def transcribe_long(self, audio, max_chunk_s=30.0, min_silence_s=0.6):
+        """Transcribe a long recording by splitting on silence first.
+
+        Cuts only in pauses (never mid-word) into model-friendly chunks, then
+        reuses the per-clip ``transcribe`` path (scrub + low priority) for each,
+        printing progress so the end-of-session wait isn't opaque. Chunk texts
+        are joined with single spaces; per-chunk capitalization/punctuation at
+        seams is intentionally left as-is (cosmetic only).
+        """
+        if audio.size == 0:
+            return ""
+        chunks = split_on_silence(
+            audio, sample_rate=SAMPLE_RATE,
+            max_chunk_s=max_chunk_s, min_silence_s=min_silence_s,
+        )
+        parts = []
+        for idx, chunk in enumerate(chunks, 1):
+            print(f"[long] chunk {idx}/{len(chunks)} ({chunk.size / SAMPLE_RATE:.1f}s)...")
+            piece = self.transcribe(chunk)
+            if piece:
+                parts.append(piece)
+        # One chunk per line: each silence-bounded segment is typed on its own line.
+        return "\n".join(parts)
+
 
 class App:
-    """Push-to-talk: hold Ctrl+Win to record, release to transcribe & type."""
+    """Two ways to dictate:
+      - Hold Ctrl+Win to record, release to transcribe & type (push-to-talk).
+      - Tap Win+Left-Shift to start a long hands-free session; tap again to stop.
+        On stop the buffer is split on silence and transcribed chunk by chunk.
+    """
 
-    def __init__(self, recorder, transcriber):
+    def __init__(self, recorder, transcriber, max_chunk_s=30.0, min_silence_s=0.6):
         self.recorder = recorder
         self.transcriber = transcriber
+        self.max_chunk_s = max_chunk_s
+        self.min_silence_s = min_silence_s
         self.kbd = Controller()
         self._pressed = set()
-        self._recording = False
+        self._recording = False     # hold-to-talk active
+        self._session = False       # long toggle session active
+        self._toggle_armed = True   # edge-trigger guard for the toggle combo
         self._lock = threading.Lock()
 
     def _on_press(self, key):
         self._pressed.add(self._normalize(key))
-        if not self._recording and TRIGGER_KEYS.issubset(self._pressed):
+
+        # --- Long-session toggle (Win+Left-Shift), edge-triggered ---
+        if TOGGLE_KEYS.issubset(self._pressed):
+            if self._toggle_armed:
+                self._toggle_armed = False   # one physical tap fires once
+                self._toggle_session()
+            return
+
+        # --- Hold-to-talk (Ctrl+Win) -- suppressed while a session is active ---
+        if (not self._session and not self._recording
+                and TRIGGER_KEYS.issubset(self._pressed)):
             with self._lock:
                 if not self._recording:
                     self._recording = True
@@ -315,6 +417,15 @@ class App:
 
     def _on_release(self, key):
         self._pressed.discard(self._normalize(key))
+
+        # Re-arm the toggle once the combo is broken, so the next full press fires.
+        if not TOGGLE_KEYS.issubset(self._pressed):
+            self._toggle_armed = True
+
+        # A long session owns the recorder; never let release end it (the toggle does).
+        if self._session:
+            return
+
         if self._recording and not TRIGGER_KEYS.issubset(self._pressed):
             with self._lock:
                 if self._recording:
@@ -322,14 +433,41 @@ class App:
                     audio = self.recorder.stop()
                     threading.Thread(target=self._handle, args=(audio,), daemon=True).start()
 
+    def _toggle_session(self):
+        with self._lock:
+            if not self._session:
+                # Don't start a session on top of a hold-to-talk recording.
+                if self._recording:
+                    return
+                self._session = True
+                print("\n[long] Long session recording... "
+                      "(tap Win+Left-Shift again to stop)")
+                self.recorder.start()
+            else:
+                self._session = False
+                audio = self.recorder.stop()
+                print(f"[long] Stopped ({audio.size / SAMPLE_RATE:.1f}s). Transcribing...")
+                threading.Thread(target=self._handle_long, args=(audio,), daemon=True).start()
+
     @staticmethod
     def _normalize(key):
-        # Collapse left/right variants into the generic keys used in TRIGGER_KEYS.
-        if key in (Key.shift_l, Key.shift_r):
+        # Collapse left/right variants into the generic keys used in the triggers.
+        # Left-Shift is kept distinct on purpose: the long-session toggle is bound
+        # specifically to Win + Left-Shift, so right shift must not stand in for it.
+        if key == Key.shift_r:
             return Key.shift
         if key in (Key.cmd_l, Key.cmd_r):
             return Key.cmd
         return key
+
+    def _type(self, text):
+        # pynput's kbd.type() bursts characters as fast as the OS accepts them,
+        # which makes Notepad (and other windows) drop characters -- producing
+        # garbled output with whole words missing. Type one char at a time with a
+        # tiny delay so the target window keeps up.
+        for ch in text:
+            self.kbd.type(ch)
+            time.sleep(0.006)
 
     def _handle(self, audio):
         dur = audio.size / SAMPLE_RATE
@@ -339,10 +477,21 @@ class App:
             print("[out] (nothing recognised)")
             return
         print(f"[out] {text}")
-        self.kbd.type(text + " ")
+        self._type(text + " ")
+
+    def _handle_long(self, audio):
+        text = self.transcriber.transcribe_long(
+            audio, max_chunk_s=self.max_chunk_s, min_silence_s=self.min_silence_s,
+        )
+        if not text:
+            print("[out] (nothing recognised)")
+            return
+        print(f"[out] {text}")
+        self._type(text + " ")
 
     def run(self):
-        print("\nReady. Hold Ctrl+Win to dictate. Ctrl+C in this window to quit.\n")
+        print("\nReady. Hold Ctrl+Win to dictate, or tap Win+Left-Shift for a "
+              "long session. Ctrl+C in this window to quit.\n")
         with keyboard.Listener(on_press=self._on_press, on_release=self._on_release) as listener:
             listener.join()
 
@@ -373,6 +522,12 @@ def main():
                         "so other apps stay responsive).")
     p.add_argument("--priority", choices=["below", "normal"], default="below",
                    help="process priority during transcription (default: below normal).")
+    p.add_argument("--max-chunk", type=float, default=30.0,
+                   help="long-session: target max seconds per chunk before cutting at the "
+                        "next pause (default: 30).")
+    p.add_argument("--min-silence", type=float, default=0.6,
+                   help="long-session: minimum pause length (seconds) that counts as a "
+                        "cut point (default: 0.6).")
     args = p.parse_args()
 
     device = pick_device(args.device if args.device else None)
@@ -383,7 +538,8 @@ def main():
         threads=args.threads,
         low_priority=(args.priority == "below"),
     )
-    App(recorder, transcriber).run()
+    App(recorder, transcriber,
+        max_chunk_s=args.max_chunk, min_silence_s=args.min_silence).run()
 
 
 if __name__ == "__main__":
