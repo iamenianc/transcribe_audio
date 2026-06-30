@@ -524,17 +524,20 @@ def transcribe_file(path, transcriber, max_chunk_s=30.0, min_silence_s=0.6):
         audio, sample_rate=SAMPLE_RATE,
         max_chunk_s=max_chunk_s, min_silence_s=min_silence_s,
     )
+    started = time.time()
     lines = []
     for n, chunk in enumerate(chunks, 1):
         text = transcriber.transcribe(chunk)
         if text:
             print(f"[file] chunk {n}/{len(chunks)}: {text}")
             lines.append(text)
+    elapsed = time.time() - started
 
     out_path = os.path.splitext(path)[0] + ".txt"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + ("\n" if lines else ""))
-    print(f"[file] Wrote transcript to {out_path}")
+    speed = f", {dur / elapsed:.0f}x realtime" if elapsed > 0 else ""
+    print(f"[file] Done in {elapsed:.1f}s{speed}. Wrote transcript to {out_path}")
     return out_path
 
 
@@ -829,10 +832,12 @@ def main():
     p.add_argument("--no-scrub", action="store_true",
                    help="disable filler-word scrubbing (type the raw transcription).")
     p.add_argument("--threads", type=int, default=None,
-                   help="max CPU threads for inference (default: half your physical cores, "
-                        "so other apps stay responsive).")
-    p.add_argument("--priority", choices=["below", "normal"], default="below",
-                   help="process priority during transcription (default: below normal).")
+                   help="max CPU threads for inference. Default: half your physical cores in "
+                        "live mode (so other apps stay responsive); ALL physical cores in "
+                        "--file mode (it's the foreground task, so go fast).")
+    p.add_argument("--priority", choices=["below", "normal"], default=None,
+                   help="process priority during transcription. Default: 'below' in live "
+                        "mode (stay out of your way); 'normal' in --file mode.")
     p.add_argument("--max-chunk", type=float, default=30.0,
                    help="long-session: target max seconds per chunk before cutting at the "
                         "next pause (default: 30).")
@@ -848,13 +853,25 @@ def main():
             print("Cancelled.")
             return
 
+    # File mode is the foreground task, so by default it runs FAST: all physical
+    # cores and normal priority. Live mode stays polite (half the cores, below-
+    # normal priority) so dictation never competes with your other apps. Either
+    # default is overridden by an explicit --threads / --priority flag.
+    if args.file:
+        threads = args.threads if args.threads is not None \
+            else (psutil.cpu_count(logical=False) or psutil.cpu_count() or 2)
+        priority = args.priority or "normal"
+    else:
+        threads = args.threads          # None -> Transcriber picks half the cores
+        priority = args.priority or "below"
+
     transcriber = Transcriber(
         scrub=not args.no_scrub,
-        threads=args.threads,
-        low_priority=(args.priority == "below"),
+        threads=threads,
+        low_priority=(priority == "below"),
     )
 
-    # Batch mode: transcribe a prerecorded WAV and exit (no mic, no hotkeys).
+    # Batch mode: transcribe a prerecorded file and exit (no mic, no hotkeys).
     if args.file:
         transcribe_file(args.file, transcriber,
                         max_chunk_s=args.max_chunk, min_silence_s=args.min_silence)
