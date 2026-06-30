@@ -43,16 +43,14 @@ Run directly:
 python transcriber.py
 ```
 
-Or use the Windows launchers:
+Or use the Windows launcher:
 
-- [`run.bat`](run.bat) — NVIDIA Parakeet engine (default, fast, English)
-- [`run-whisper.bat`](run-whisper.bat) — Whisper small.en (balanced)
+- [`run.bat`](run.bat) — NVIDIA Parakeet (fast, English)
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--engine {parakeet,whisper}` | `parakeet` | Transcription engine. `parakeet` (~600 MB, fast, English) or `whisper` (Whisper small.en, ~250 MB, balanced). |
 | `--device SUBSTRING` | `USB PnP` | Substring of the input device name. Pass `''` for the system default. |
 | `--no-scrub` | off | Disable filler-word scrubbing; type the raw transcription. |
 | `--threads N` | half your physical cores | Max CPU threads for inference, so other apps stay responsive. |
@@ -61,7 +59,7 @@ Or use the Windows launchers:
 Example:
 
 ```sh
-python transcriber.py --engine whisper --device "" --threads 4
+python transcriber.py --device "" --threads 4
 ```
 
 ## Notes

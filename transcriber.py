@@ -2,8 +2,8 @@
 Push-to-talk dictation tool.
 
 Hold the hotkey (default: Ctrl + Windows key held together), speak, and release.
-The captured audio is transcribed locally (NVIDIA Parakeet / Whisper via ONNX,
-CPU) and the resulting text is typed into whatever window currently has focus.
+The captured audio is transcribed locally (NVIDIA Parakeet via ONNX, CPU) and
+the resulting text is typed into whatever window currently has focus.
 
 Everything runs offline on the CPU. No audio ever leaves the machine.
 """
@@ -26,7 +26,7 @@ import sounddevice as sd
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
 
-SAMPLE_RATE = 16000          # Whisper expects 16 kHz mono
+SAMPLE_RATE = 16000          # model expects 16 kHz mono
 CHANNELS = 1
 # Keys that must ALL be held down at once to trigger (hold-to-talk) recording.
 TRIGGER_KEYS = {Key.ctrl_l, Key.cmd}
@@ -353,36 +353,22 @@ def _below_normal_priority(enabled=True):
             proc.nice(original)
 
 
-# Selectable transcription engines. Each: onnx-asr model name + quantization +
-# a friendly label/size note. Both run on CPU with the same safeguards & scrub.
-ENGINES = {
-    "parakeet": {
-        "model": "nemo-parakeet-tdt-0.6b-v2",
-        "quantization": "int8",
-        "label": "NVIDIA Parakeet TDT 0.6B (English)",
-        "size": "~600MB",
-    },
-    "whisper": {
-        "model": "onnx-community/whisper-small.en",
-        "quantization": "int8",
-        "label": "Whisper small.en (English, balanced)",
-        "size": "~250MB",
-    },
+# The transcription model: NVIDIA Parakeet TDT 0.6B, int8, CPU. English-only,
+# fast, ~600MB (downloaded on first run).
+MODEL = {
+    "model": "nemo-parakeet-tdt-0.6b-v2",
+    "quantization": "int8",
+    "label": "NVIDIA Parakeet TDT 0.6B (English)",
+    "size": "~600MB",
 }
-DEFAULT_ENGINE = "parakeet"
 
 
 class Transcriber:
-    """Transcribes audio on CPU via onnx-asr, capped so it doesn't hog the
-    machine. Engine is selectable (Parakeet or Whisper small.en).
-    Output is post-processed by scrub_disfluencies()."""
+    """Transcribes audio on CPU via onnx-asr (NVIDIA Parakeet), capped so it
+    doesn't hog the machine. Output is post-processed by scrub_disfluencies()."""
 
-    def __init__(self, engine=DEFAULT_ENGINE, scrub=True,
-                 threads=None, low_priority=True):
-        if engine not in ENGINES:
-            raise ValueError(f"Unknown engine {engine!r}; choose from {list(ENGINES)}")
-        cfg = ENGINES[engine]
-        self.engine = engine
+    def __init__(self, scrub=True, threads=None, low_priority=True):
+        cfg = MODEL
         # Default to half the physical cores so the user's other apps keep CPU.
         if threads is None:
             cores = psutil.cpu_count(logical=False) or psutil.cpu_count() or 2
@@ -632,10 +618,8 @@ def pick_device(name_substring):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Push-to-talk local dictation (ONNX, CPU).")
-    p.add_argument("--engine", choices=list(ENGINES), default=DEFAULT_ENGINE,
-                   help="transcription engine. 'parakeet' (default, fast, English) or "
-                        "'whisper' (Whisper small.en, balanced).")
+    p = argparse.ArgumentParser(description="Push-to-talk local dictation "
+                                            "(NVIDIA Parakeet, ONNX, CPU).")
     p.add_argument("--device", default="USB PnP",
                    help="substring of the input device name (default: 'USB PnP'). "
                         "Pass '' to use the system default.")
@@ -657,7 +641,6 @@ def main():
     device = pick_device(args.device if args.device else None)
     recorder = Recorder(device=device)
     transcriber = Transcriber(
-        engine=args.engine,
         scrub=not args.no_scrub,
         threads=args.threads,
         low_priority=(args.priority == "below"),
