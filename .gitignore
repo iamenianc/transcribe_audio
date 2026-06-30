@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloaded ASR models / HuggingFace cache (multi-GB, fetched on first run)
+models/
+*.onnx
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

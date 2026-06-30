@@ -4,7 +4,9 @@
       "Bash(py -c \"import ast; ast.parse\\(open\\('transcriber.py'\\).read\\(\\)\\); print\\('SYNTAX OK'\\)\")",
       "Bash(py -c *)",
       "Bash(py -m pip install \"onnx-asr[cpu,hub]\" psutil)",
-      "PowerShell(Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile\\(\"c:\\\\Users\\\\ianch\\\\sourecode\\\\repos\\\\transcriber\\\\_tts_test.wav\"\\); $s.Speak\\(\"The quick brown fox jumps over the lazy dog. My pin is nine four eight one.\"\\); $s.Dispose\\(\\); Write-Output \"WAV written\")"
+      "PowerShell(Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile\\(\"c:\\\\Users\\\\ianch\\\\sourecode\\\\repos\\\\transcriber\\\\_tts_test.wav\"\\); $s.Speak\\(\"The quick brown fox jumps over the lazy dog. My pin is nine four eight one.\"\\); $s.Dispose\\(\\); Write-Output \"WAV written\")",
+      "Bash(git -C \"c:/Users/ianch/sourecode/repos/transcriber\" status --short)",
+      "Bash(git add *)"
     ]
   }
 }
