@@ -5,9 +5,10 @@ Hold the hotkey (default: Ctrl + Windows key held together), speak, and release.
 The captured audio is transcribed locally (NVIDIA Parakeet via ONNX, CPU) and
 the resulting text is typed into whatever window currently has focus.
 
-Alternatively, pass ``--file recording.wav`` to transcribe a prerecorded WAV in
-batch; the text is written to ``recording.txt`` next to the source (no mic, no
-hotkeys, no typing into a window).
+Alternatively, pass ``--file recording.mp3`` to transcribe a prerecorded media
+file in batch (WAV, MP3, MP4, M4A, ...); the text is written to a ``.txt`` next
+to the source (no mic, no hotkeys, no typing into a window). Non-WAV formats are
+decoded with ffmpeg, which must be on PATH.
 
 Everything runs offline on the CPU. No audio ever leaves the machine.
 """
@@ -413,6 +414,53 @@ class Transcriber:
         return text
 
 
+def load_via_ffmpeg(path):
+    """Decode any media file (mp3, mp4, m4a, ...) to 16 kHz mono float32.
+
+    Shells out to ffmpeg, which must be on PATH, and asks it to output raw
+    32-bit float little-endian PCM at the model's sample rate / mono on stdout.
+    ffmpeg handles the demux, decode, downmix, and resample, so we just wrap the
+    bytes in a numpy array. Raises a clear error if ffmpeg is missing or fails.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            f"ffmpeg is required to read {os.path.splitext(path)[1]} files but was not "
+            "found on PATH. Install it (e.g. `winget install Gyan.FFmpeg`) or convert "
+            "the file to WAV first."
+        )
+
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-i", path,
+        "-f", "f32le",              # raw 32-bit float little-endian
+        "-acodec", "pcm_f32le",
+        "-ac", "1",                 # mono
+        "-ar", str(SAMPLE_RATE),    # 16 kHz
+        "-",                        # write to stdout
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg failed to decode {path}:\n{err}")
+
+    audio = np.frombuffer(proc.stdout, dtype="<f4")
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def load_audio(path):
+    """Load any supported media file into a 16 kHz mono float32 array.
+
+    WAV files are read with the stdlib (no deps); everything else (mp3, mp4,
+    m4a, etc.) is decoded via ffmpeg.
+    """
+    if os.path.splitext(path)[1].lower() == ".wav":
+        return load_wav(path)
+    return load_via_ffmpeg(path)
+
+
 def load_wav(path):
     """Read a WAV file into a 16 kHz mono float32 array for the model.
 
@@ -461,13 +509,14 @@ def load_wav(path):
 
 
 def transcribe_file(path, transcriber, max_chunk_s=30.0, min_silence_s=0.6):
-    """Transcribe a prerecorded WAV and write the text to a .txt beside it.
+    """Transcribe a prerecorded media file and write the text to a .txt beside it.
 
+    Accepts WAV (stdlib) plus anything ffmpeg can decode (mp3, mp4, m4a, ...).
     Reuses the same silence-aware chunking as a long mic session so arbitrarily
     long files are handled. Returns the output path.
     """
     print(f"[file] Loading {path}...")
-    audio = load_wav(path)
+    audio = load_audio(path)
     dur = audio.size / SAMPLE_RATE
     print(f"[file] {dur:.1f}s of audio; transcribing...")
 
@@ -701,8 +750,9 @@ def main():
     p = argparse.ArgumentParser(description="Push-to-talk local dictation "
                                             "(NVIDIA Parakeet, ONNX, CPU).")
     p.add_argument("--file", default=None,
-                   help="transcribe a prerecorded WAV in batch and write the text to a "
-                        ".txt next to it, then exit (no mic, no hotkeys).")
+                   help="transcribe a prerecorded media file (WAV, MP3, MP4, M4A, ...) in "
+                        "batch and write the text to a .txt next to it, then exit (no mic, "
+                        "no hotkeys). Non-WAV formats require ffmpeg on PATH.")
     p.add_argument("--device", default="USB PnP",
                    help="substring of the input device name (default: 'USB PnP'). "
                         "Pass '' to use the system default.")
