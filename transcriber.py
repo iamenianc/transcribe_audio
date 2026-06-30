@@ -5,6 +5,10 @@ Hold the hotkey (default: Ctrl + Windows key held together), speak, and release.
 The captured audio is transcribed locally (NVIDIA Parakeet via ONNX, CPU) and
 the resulting text is typed into whatever window currently has focus.
 
+Alternatively, pass ``--file recording.wav`` to transcribe a prerecorded WAV in
+batch; the text is written to ``recording.txt`` next to the source (no mic, no
+hotkeys, no typing into a window).
+
 Everything runs offline on the CPU. No audio ever leaves the machine.
 """
 
@@ -409,6 +413,82 @@ class Transcriber:
         return text
 
 
+def load_wav(path):
+    """Read a WAV file into a 16 kHz mono float32 array for the model.
+
+    Uses only the stdlib ``wave`` module + numpy (no extra deps, in keeping with
+    the app's offline/minimal footprint). Handles 8/16/24/32-bit integer PCM,
+    downmixes multi-channel to mono, normalizes to [-1, 1], and resamples to
+    ``SAMPLE_RATE`` by linear interpolation.
+    """
+    import wave
+
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()          # bytes per sample
+        rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+
+    # Decode PCM bytes to float32 in [-1, 1] based on sample width.
+    if sampwidth == 1:                         # 8-bit PCM is unsigned, centered at 128
+        ints = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        audio = (ints - 128.0) / 128.0
+    elif sampwidth == 2:                       # 16-bit signed
+        ints = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+        audio = ints / 32768.0
+    elif sampwidth == 3:                       # 24-bit signed, packed 3 bytes/sample
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        ints = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        ints = np.where(ints & 0x800000, ints - 0x1000000, ints)  # sign-extend
+        audio = ints.astype(np.float32) / 8388608.0
+    elif sampwidth == 4:                       # 32-bit signed
+        ints = np.frombuffer(raw, dtype="<i4").astype(np.float32)
+        audio = ints / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+
+    # Downmix to mono by averaging channels (frames are interleaved).
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
+
+    # Resample to the model's expected rate by linear interpolation.
+    if rate != SAMPLE_RATE and audio.size:
+        n_out = int(round(audio.size * SAMPLE_RATE / rate))
+        src = np.linspace(0.0, audio.size - 1, num=n_out, dtype=np.float64)
+        audio = np.interp(src, np.arange(audio.size), audio).astype(np.float32)
+
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def transcribe_file(path, transcriber, max_chunk_s=30.0, min_silence_s=0.6):
+    """Transcribe a prerecorded WAV and write the text to a .txt beside it.
+
+    Reuses the same silence-aware chunking as a long mic session so arbitrarily
+    long files are handled. Returns the output path.
+    """
+    print(f"[file] Loading {path}...")
+    audio = load_wav(path)
+    dur = audio.size / SAMPLE_RATE
+    print(f"[file] {dur:.1f}s of audio; transcribing...")
+
+    chunks = split_on_silence(
+        audio, sample_rate=SAMPLE_RATE,
+        max_chunk_s=max_chunk_s, min_silence_s=min_silence_s,
+    )
+    lines = []
+    for n, chunk in enumerate(chunks, 1):
+        text = transcriber.transcribe(chunk)
+        if text:
+            print(f"[file] chunk {n}/{len(chunks)}: {text}")
+            lines.append(text)
+
+    out_path = os.path.splitext(path)[0] + ".txt"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    print(f"[file] Wrote transcript to {out_path}")
+    return out_path
+
+
 class App:
     """Two ways to dictate:
       - Hold Ctrl+Win to record, release to transcribe & type (push-to-talk).
@@ -620,6 +700,9 @@ def pick_device(name_substring):
 def main():
     p = argparse.ArgumentParser(description="Push-to-talk local dictation "
                                             "(NVIDIA Parakeet, ONNX, CPU).")
+    p.add_argument("--file", default=None,
+                   help="transcribe a prerecorded WAV in batch and write the text to a "
+                        ".txt next to it, then exit (no mic, no hotkeys).")
     p.add_argument("--device", default="USB PnP",
                    help="substring of the input device name (default: 'USB PnP'). "
                         "Pass '' to use the system default.")
@@ -638,13 +721,20 @@ def main():
                         "cut point (default: 0.6).")
     args = p.parse_args()
 
-    device = pick_device(args.device if args.device else None)
-    recorder = Recorder(device=device)
     transcriber = Transcriber(
         scrub=not args.no_scrub,
         threads=args.threads,
         low_priority=(args.priority == "below"),
     )
+
+    # Batch mode: transcribe a prerecorded WAV and exit (no mic, no hotkeys).
+    if args.file:
+        transcribe_file(args.file, transcriber,
+                        max_chunk_s=args.max_chunk, min_silence_s=args.min_silence)
+        return
+
+    device = pick_device(args.device if args.device else None)
+    recorder = Recorder(device=device)
     App(recorder, transcriber,
         max_chunk_s=args.max_chunk, min_silence_s=args.min_silence).run()
 
