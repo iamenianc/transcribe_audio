@@ -187,6 +187,20 @@ class Recorder:
         while not self._q.empty():
             self._frames.append(self._q.get())
 
+    def snapshot(self):
+        """Return all audio captured so far WITHOUT stopping the stream.
+
+        Used for live transcription during a long session: callers can poll this
+        repeatedly, transcribe whatever new audio has accumulated, and keep
+        recording. Returns a flat float32 array (empty if nothing captured yet).
+        """
+        if self._stream is None:
+            return np.zeros(0, dtype=np.float32)
+        self._drain()
+        if not self._frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(self._frames, axis=0).flatten()
+
     def stop(self):
         if self._stream is None:
             return np.zeros(0, dtype=np.float32)
@@ -253,6 +267,56 @@ def split_on_silence(audio, sample_rate=SAMPLE_RATE, max_chunk_s=30.0,
         chunks.append(audio[start * hop :])
 
     return chunks if chunks else [audio]
+
+
+def split_completed_chunks(audio, sample_rate=SAMPLE_RATE, max_chunk_s=30.0,
+                           min_silence_s=0.6, silence_rms=0.005, min_chunk_s=1.0):
+    """Like ``split_on_silence`` but for LIVE use: only emit chunks that are
+    closed by a real silence gap, and report how much audio was consumed.
+
+    Returns ``(chunks, consumed_samples)``. The trailing audio after the last
+    silence cut is assumed to be speech still in progress, so it is NOT emitted
+    and NOT counted as consumed -- the caller keeps it and re-feeds it next poll
+    once the speaker pauses. This guarantees we never type a half-spoken word.
+    """
+    n = audio.size
+    if n == 0:
+        return [], 0
+
+    hop = max(1, int(0.02 * sample_rate))            # 20 ms frames
+    n_frames = n // hop
+    if n_frames == 0:
+        return [], 0
+    frames = audio[: n_frames * hop].reshape(n_frames, hop)
+    rms = np.sqrt(np.mean(frames.astype(np.float32) ** 2, axis=1))
+    is_silent = rms < silence_rms
+
+    max_frames = int(max_chunk_s * sample_rate / hop)
+    min_silence_frames = max(1, int(min_silence_s * sample_rate / hop))
+    min_chunk_frames = max(1, int(min_chunk_s * sample_rate / hop))
+
+    chunks = []
+    start = 0            # frame index where the current (open) chunk begins
+    consumed_frames = 0  # frames past the end of the last completed silence gap
+    i = 0
+    while i < n_frames:
+        if i - start >= max_frames and is_silent[i]:
+            j = i
+            while j < n_frames and is_silent[j]:
+                j += 1
+            # Only a gap that has actually ENDED (j < n_frames) is a real, closed
+            # pause. A silence run still touching the buffer end may just be a brief
+            # lull before more speech, so we leave it for the next poll.
+            if j - i >= min_silence_frames and j < n_frames:
+                if i - start >= min_chunk_frames:
+                    chunks.append(audio[start * hop : i * hop])
+                start = j
+                consumed_frames = j
+                i = j
+                continue
+        i += 1
+
+    return chunks, consumed_frames * hop
 
 
 @contextlib.contextmanager
@@ -352,36 +416,14 @@ class Transcriber:
             text = cleaned
         return text
 
-    def transcribe_long(self, audio, max_chunk_s=30.0, min_silence_s=0.6):
-        """Transcribe a long recording by splitting on silence first.
-
-        Cuts only in pauses (never mid-word) into model-friendly chunks, then
-        reuses the per-clip ``transcribe`` path (scrub + low priority) for each,
-        printing progress so the end-of-session wait isn't opaque. Chunk texts
-        are joined with single spaces; per-chunk capitalization/punctuation at
-        seams is intentionally left as-is (cosmetic only).
-        """
-        if audio.size == 0:
-            return ""
-        chunks = split_on_silence(
-            audio, sample_rate=SAMPLE_RATE,
-            max_chunk_s=max_chunk_s, min_silence_s=min_silence_s,
-        )
-        parts = []
-        for idx, chunk in enumerate(chunks, 1):
-            print(f"[long] chunk {idx}/{len(chunks)} ({chunk.size / SAMPLE_RATE:.1f}s)...")
-            piece = self.transcribe(chunk)
-            if piece:
-                parts.append(piece)
-        # One chunk per line: each silence-bounded segment is typed on its own line.
-        return "\n".join(parts)
-
 
 class App:
     """Two ways to dictate:
       - Hold Ctrl+Win to record, release to transcribe & type (push-to-talk).
       - Tap Win+Left-Shift to start a long hands-free session; tap again to stop.
-        On stop the buffer is split on silence and transcribed chunk by chunk.
+        During the session each silence-bounded chunk is transcribed and typed
+        LIVE as you speak (keep focus on the target window), so a failure costs
+        only one chunk rather than the whole hour.
     """
 
     def __init__(self, recorder, transcriber, max_chunk_s=30.0, min_silence_s=0.6):
@@ -394,6 +436,8 @@ class App:
         self._recording = False     # hold-to-talk active
         self._session = False       # long toggle session active
         self._toggle_armed = True   # edge-trigger guard for the toggle combo
+        self._session_stop = None   # threading.Event signalling the live worker to finish
+        self._worker = None         # live-transcription worker thread
         self._lock = threading.Lock()
 
     def _on_press(self, key):
@@ -440,14 +484,17 @@ class App:
                 if self._recording:
                     return
                 self._session = True
-                print("\n[long] Long session recording... "
+                print("\n[long] Long session recording (typing live as you speak)... "
                       "(tap Win+Left-Shift again to stop)")
                 self.recorder.start()
+                self._session_stop = threading.Event()
+                self._worker = threading.Thread(target=self._live_worker, daemon=True)
+                self._worker.start()
             else:
                 self._session = False
-                audio = self.recorder.stop()
-                print(f"[long] Stopped ({audio.size / SAMPLE_RATE:.1f}s). Transcribing...")
-                threading.Thread(target=self._handle_long, args=(audio,), daemon=True).start()
+                print("[long] Stopping...")
+                # Signal the worker; it stops the recorder and flushes the tail.
+                self._session_stop.set()
 
     @staticmethod
     def _normalize(key):
@@ -479,15 +526,45 @@ class App:
         print(f"[out] {text}")
         self._type(text + " ")
 
-    def _handle_long(self, audio):
-        text = self.transcriber.transcribe_long(
-            audio, max_chunk_s=self.max_chunk_s, min_silence_s=self.min_silence_s,
-        )
+    def _live_worker(self):
+        """Drive a long session: type each completed chunk as it's ready.
+
+        Polls the still-running recorder, splits off only chunks that are closed
+        by a real pause (never a half-spoken word), transcribes and types each,
+        and tracks how much audio has been consumed. On stop it drains the final
+        tail through ``split_on_silence`` so the last (open) utterance is typed.
+        """
+        consumed = 0  # samples already transcribed-and-typed from the buffer
+        while not self._session_stop.is_set():
+            self._session_stop.wait(2.0)   # poll cadence; wakes early on stop
+            buf = self.recorder.snapshot()
+            pending = buf[consumed:]
+            chunks, used = split_completed_chunks(
+                pending, sample_rate=SAMPLE_RATE,
+                max_chunk_s=self.max_chunk_s, min_silence_s=self.min_silence_s,
+            )
+            for chunk in chunks:
+                self._type_chunk(chunk)
+            consumed += used
+
+        # --- stop: close the stream and flush the remaining tail ---
+        audio = self.recorder.stop()
+        tail = audio[consumed:]
+        print(f"[long] Stopped. Flushing final {tail.size / SAMPLE_RATE:.1f}s...")
+        for chunk in split_on_silence(
+            tail, sample_rate=SAMPLE_RATE,
+            max_chunk_s=self.max_chunk_s, min_silence_s=self.min_silence_s,
+        ):
+            self._type_chunk(chunk)
+        print("[long] Session complete.")
+
+    def _type_chunk(self, chunk):
+        """Transcribe one audio chunk and type it on its own line."""
+        text = self.transcriber.transcribe(chunk)
         if not text:
-            print("[out] (nothing recognised)")
             return
         print(f"[out] {text}")
-        self._type(text + " ")
+        self._type(text + "\n")
 
     def run(self):
         print("\nReady. Hold Ctrl+Win to dictate, or tap Win+Left-Shift for a "
