@@ -399,13 +399,36 @@ class Transcriber:
         )
         print("[init] Model ready.")
 
+    # Parakeet/onnx-asr occasionally returns an EMPTY hypothesis for a segment of
+    # an unlucky exact length, even when it's clearly speech (observed on ~15-30s
+    # chunks). The failure is purely length-sensitive: trimming a few tens of ms
+    # off the end nudges it to a good length and the words come back in full. So
+    # when a chunk that clearly has speech energy transcribes to nothing, retry
+    # with small end-trims before giving up.
+    _RETRY_TRIMS_MS = (50, 120, 30, 200, 80)   # mixed small offsets to escape bad lengths
+    _SPEECH_RMS = 0.01                          # above this, an empty result is suspicious
+
+    def _recognize(self, audio: np.ndarray) -> str:
+        with _below_normal_priority(self.low_priority):
+            return (self.model.recognize(audio, sample_rate=SAMPLE_RATE) or "").strip()
+
     def transcribe(self, audio: np.ndarray) -> str:
         if audio.size == 0:
             return ""
         audio = np.ascontiguousarray(audio, dtype=np.float32)
-        with _below_normal_priority(self.low_priority):
-            text = self.model.recognize(audio, sample_rate=SAMPLE_RATE)
-        text = (text or "").strip()
+        text = self._recognize(audio)
+        # Empty result on audio that clearly contains speech -> hit a bad length.
+        # Retry with tiny end-trims (each removes <0.2s, never a whole word).
+        if not text and float(np.sqrt(np.mean(audio ** 2))) >= self._SPEECH_RMS:
+            for trim_ms in self._RETRY_TRIMS_MS:
+                n = int(trim_ms / 1000 * SAMPLE_RATE)
+                if n >= audio.size:
+                    break
+                retry = self._recognize(np.ascontiguousarray(audio[:-n], dtype=np.float32))
+                if retry:
+                    print(f"[retry] recovered an empty chunk by trimming {trim_ms}ms")
+                    text = retry
+                    break
         if self.scrub:
             cleaned = scrub_disfluencies(text)
             if cleaned != text:
